@@ -2,7 +2,9 @@
 .venv/
 .venv-1/
 
-# WESAD dataset (too large for GitHub)
+# WESAD dataset and generated outputs (large / regenerable)
+Data/WESAD/
+Data/WESAD_EDA_Output/
 archive/
 archive.zip
 

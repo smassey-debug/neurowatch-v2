@@ -18,6 +18,11 @@ pandas>=2.0.0
 # ── Visualisation ─────────────────────────────────────────────────────────────
 matplotlib>=3.7.0
 
+# ── Phase 2: Live Watch (api.py + watch_simulation.py) ────────────────────────
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+requests>=2.31.0
+
 # ── Standard Library (no install needed — included with Python 3.9+) ──────────
 # sqlite3    — user authentication database
 # hashlib    — PBKDF2-HMAC-SHA256 password hashing

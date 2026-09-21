@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 import pickle
 import os
 import time
+import requests
 import sqlite3
 import hashlib
 import hmac
@@ -540,6 +541,8 @@ defaults = {
     "cm":            None,
     "sim_log":       None,
     "loaded_subjects": [],
+    "live_log":      None,
+    "live_api_url":  "http://localhost:8000",
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -1019,6 +1022,50 @@ with st.sidebar:
     run_sim     = st.button("▶ Run Live Simulation", use_container_width=True)
 
     st.markdown("---")
+    st.markdown("### 🔴 Live Watch (Phase 2)")
+    live_api_url = st.text_input("Live API URL", value=st.session_state.live_api_url,
+                                  key="live_api_url_input",
+                                  help="Where api.py is running — start it separately "
+                                       "with `uvicorn api:app --port 8000`.")
+    st.session_state.live_api_url = live_api_url
+
+    poll_seconds = st.slider("Poll Interval (sec)", 1, 15, 2, key="poll_seconds")
+    poll_cycles  = st.slider("Cycles to Poll", 5, 120, 30, key="poll_cycles")
+    start_live   = st.button("▶ Start Live Feed", use_container_width=True)
+
+    cal1, cal2 = st.columns(2)
+    with cal1:
+        push_cal = st.button("📡 Push Calibration", use_container_width=True,
+                              disabled=st.session_state.model is None,
+                              help="Sends WESAD mean/std per feature to the API so "
+                                   "watch_simulation.py drifts around realistic values.")
+    with cal2:
+        reset_live = st.button("🗑️ Reset Live Buffer", use_container_width=True)
+
+    if push_cal:
+        try:
+            stats = st.session_state.df_all[FEATURES].agg(["mean", "std"]).to_dict()
+            stats = {f: {"mean": float(v["mean"]), "std": float(v["std"])} for f, v in stats.items()}
+            r = requests.post(f"{live_api_url}/calibration", json={"stats": stats}, timeout=4)
+            if r.status_code == 200:
+                st.success("✅ Calibration pushed to live API.")
+            else:
+                st.error(f"API rejected calibration: {r.text}")
+        except requests.exceptions.RequestException as e:
+            st.error(f"Could not reach API at {live_api_url}: {e}")
+
+    if reset_live:
+        try:
+            r = requests.delete(f"{live_api_url}/reset", timeout=4)
+            if r.status_code == 200:
+                st.session_state.live_log = None
+                st.success("✅ Live buffer cleared.")
+            else:
+                st.error(f"API error: {r.text}")
+        except requests.exceptions.RequestException as e:
+            st.error(f"Could not reach API at {live_api_url}: {e}")
+
+    st.markdown("---")
     if st.button("🚪 Sign Out", use_container_width=True):
         log_action(st.session_state.user_id, st.session_state.username, "logout")
         for k in list(st.session_state.keys()):
@@ -1089,13 +1136,14 @@ if load_btn:
 # TABS
 # ═════════════════════════════════════════════════════════════════════════════
 
-tabs = ["📊 Live Monitor", "🔬 Model Evaluation", "📋 Clinical Report", "ℹ️ About System"]
+tabs = ["📊 Live Monitor", "🔬 Model Evaluation", "📋 Clinical Report",
+        "🔴 Live Watch", "ℹ️ About System"]
 if st.session_state.role == "admin":
     tabs.append("🛡️ Admin Panel")
 
 tab_objects = st.tabs(tabs)
-tab1, tab2, tab3, tab4 = tab_objects[:4]
-tab_admin = tab_objects[4] if len(tab_objects) > 4 else None
+tab1, tab2, tab3, tab_live, tab4 = tab_objects[:5]
+tab_admin = tab_objects[5] if len(tab_objects) > 5 else None
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TAB 1 — Live Monitor
@@ -1280,6 +1328,156 @@ with tab3:
                            mime="text/plain", use_container_width=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TAB — Live Watch (Phase 2)
+# ─────────────────────────────────────────────────────────────────────────────
+with tab_live:
+    if st.session_state.model is None:
+        st.info("Train the model first using the sidebar — Live Watch predictions "
+                 "reuse the same RandomForest + scaler as the other tabs.")
+    else:
+        st.markdown('<div class="section-title">Live Wearable Feed</div>',
+                    unsafe_allow_html=True)
+        st.markdown("""
+        <div class="info-banner">
+          This tab polls a separate <code>api.py</code> process for streamed
+          readings. Start it first — <code>uvicorn api:app --port 8000</code> —
+          then feed it with <code>python watch_simulation.py</code> (or a real
+          device posting to <code>/ingest</code>).
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ── API status ──────────────────────────────────────────────────
+        status_ph = st.empty()
+
+        def _render_status():
+            try:
+                r = requests.get(f"{st.session_state.live_api_url}/health", timeout=3)
+                if r.status_code == 200:
+                    h = r.json()
+                    with status_ph.container():
+                        s1, s2, s3 = st.columns(3)
+                        s1.metric("API Status", "🟢 Online")
+                        s2.metric("Buffered Readings", h.get("buffered_readings", 0))
+                        s3.metric("Calibrated", "Yes" if h.get("calibrated") else "No")
+                    return True
+                status_ph.error(f"API returned {r.status_code}")
+                return False
+            except requests.exceptions.RequestException as e:
+                status_ph.error(f"⚠️ Cannot reach API at {st.session_state.live_api_url} — "
+                                 f"is `uvicorn api:app --port 8000` running? ({e})")
+                return False
+
+        api_online = _render_status()
+
+        st.markdown('<div class="section-title">Live Monitor</div>',
+                    unsafe_allow_html=True)
+
+        if start_live:
+            if not api_online:
+                st.error("Cannot start — API is not reachable. Start api.py first.")
+            else:
+                log = list(st.session_state.live_log.to_dict("records")) \
+                    if st.session_state.live_log is not None else []
+                seen_ts = {r["timestamp"] for r in log} if log else set()
+
+                prog_bar = st.progress(0, text="Listening for live readings…")
+                gauge_ph = st.empty()
+                c1, c2 = st.columns(2)
+                hr_ph, ep_ph = c1.empty(), c2.empty()
+
+                for cycle in range(poll_cycles):
+                    try:
+                        r = requests.get(f"{st.session_state.live_api_url}/latest", timeout=3)
+                        if r.status_code == 200:
+                            reading = r.json()
+                            if reading["timestamp"] not in seen_ts:
+                                seen_ts.add(reading["timestamp"])
+                                feat = {k: reading[k] for k in FEATURES}
+                                state, conf, sp = predict_minute(
+                                    st.session_state.model, st.session_state.scaler, feat)
+                                log.append({
+                                    "minute": len(log) + 1,
+                                    "timestamp": reading["timestamp"],
+                                    "heart_rate": feat["heart_rate"],
+                                    "eda_mean": feat["eda_mean"],
+                                    "stress_prob": sp, "confidence": conf, "state": state,
+                                })
+                                df_log = pd.DataFrame(log)
+                                st.session_state.live_log = df_log
+
+                                with gauge_ph.container():
+                                    gc = st.columns(5)
+                                    gc[0].metric("Heart Rate", f"{feat['heart_rate']:.1f} bpm")
+                                    gc[1].metric("EDA", f"{feat['eda_mean']:.3f} µS")
+                                    gc[2].metric("Resp", f"{feat['resp_mean']:.3f}")
+                                    gc[3].metric("Temp", f"{feat['temp_mean']:.1f} °C")
+                                    gc[4].metric("SDNN", f"{feat['sdnn']:.4f} s")
+
+                                    rg1, rg2 = st.columns([1, 2])
+                                    with rg1:
+                                        st.pyplot(plot_risk_gauge(sp), use_container_width=True)
+                                    with rg2:
+                                        bcls = "badge-stress" if state == "Distress Detected" else "badge-stable"
+                                        st.markdown(f"""
+                                        <div style="padding:20px 0">
+                                          <div class="metric-label">Live AI Assessment</div>
+                                          <div style="margin:10px 0">
+                                            <span class="badge {bcls}">{state}</span>
+                                          </div>
+                                          <div style="font-family:'DM Mono',monospace;font-size:0.8rem;
+                                                      color:#4A7FA5;margin-top:8px">
+                                            Confidence: <span style="color:#38BDF8">{conf:.1%}</span>
+                                          </div>
+                                          <div style="font-family:'DM Mono',monospace;font-size:0.72rem;
+                                                      color:#334155;margin-top:4px">
+                                            Source reading: {reading['timestamp']}
+                                          </div>
+                                        </div>
+                                        """, unsafe_allow_html=True)
+
+                                with hr_ph:
+                                    st.pyplot(plot_timeseries(df_log, "heart_rate",
+                                                              "Heart Rate (bpm)", ACCENT, "BPM"),
+                                              use_container_width=True)
+                                with ep_ph:
+                                    st.pyplot(plot_timeseries(df_log, "stress_prob",
+                                                              "Stress Probability", DANGER, "Probability"),
+                                              use_container_width=True)
+                    except requests.exceptions.RequestException:
+                        pass  # transient — keep polling
+
+                    prog_bar.progress((cycle + 1) / poll_cycles,
+                                      text=f"Poll {cycle + 1}/{poll_cycles}")
+                    time.sleep(poll_seconds)
+
+                prog_bar.empty()
+                log_action(st.session_state.user_id, st.session_state.username,
+                           "live_watch_poll", f"{poll_cycles} cycles @ {poll_seconds}s")
+                st.success(f"✅ Polling complete — {len(log)} live readings received so far.")
+
+        elif st.session_state.live_log is not None and len(st.session_state.live_log) > 0:
+            df_log = st.session_state.live_log
+            st.markdown('<div class="section-title">Last Live Session</div>',
+                        unsafe_allow_html=True)
+            c1, c2 = st.columns(2)
+            c1.pyplot(plot_timeseries(df_log, "heart_rate", "Heart Rate (bpm)", ACCENT, "BPM"),
+                      use_container_width=True)
+            c2.pyplot(plot_timeseries(df_log, "stress_prob", "Stress Probability", DANGER, "Probability"),
+                      use_container_width=True)
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Avg Stress Prob", f"{df_log['stress_prob'].mean():.1%}")
+            m2.metric("Avg Heart Rate", f"{df_log['heart_rate'].mean():.1f} bpm")
+            m3.metric("Peak Stress Prob", f"{df_log['stress_prob'].max():.1%}")
+            m4.metric("Readings Received", len(df_log))
+        else:
+            st.markdown("""
+            <div style="text-align:center;padding:40px;color:#334155">
+              No live readings yet. Start <code>api.py</code> and
+              <code>watch_simulation.py</code>, then click <b>▶ Start Live Feed</b>.
+            </div>
+            """, unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
 # TAB 4 — About
 # ─────────────────────────────────────────────────────────────────────────────
 with tab4:
@@ -1307,6 +1505,10 @@ with tab4:
     - **Model**: Random Forest (600 trees, balanced class weights)
     - **Scaler**: StandardScaler (fit on training set)
     - **Auth**: SQLite user database with PBKDF2-HMAC-SHA256 password hashing
+    - **Live Watch (Phase 2)**: `api.py` (FastAPI) buffers streamed readings from
+      `watch_simulation.py` — this app polls it and runs the *same* trained
+      model + scaler, so Live Watch predictions stay consistent with the
+      WESAD playback and evaluation tabs.
 
     ---
     **Human–AI Hybrid Concept**
